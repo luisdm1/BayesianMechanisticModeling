@@ -1,0 +1,6 @@
+*files*
+*cache*
+*.rds
+.Rproj*
+*workspace*
+
