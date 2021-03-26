@@ -320,47 +320,6 @@ pairs(stan_lm_pred, pars=c('beta0', 'beta1', 'sigma'))
 
 ```{r, lm-STAN-EX-vect, cache=TRUE}
 
-stan_lm_pred_vect = "
-data {
-  int<lower=0> N1; // number of records
-  int<lower=0> K; // number of betas
-  vector[N1, K] x; // predictors matrix
-  vector[N1] y; // outcome vector
-  
-  int<lower=0> N2; // number of records for prediction
-  vector[N2, K] x_pred // matrix of predictions
-  
-}
-
-parameters {
-  real alpha; // intercept
-  vector[K] betas; // coefficients for predictors
-  real<lower=0> sigma; // error scale
-}
-
-model {
-  \\ No priors
-  
-  \\ Likelihood
-  y ~ normal(x * betas , sigma); // likelihood
-}
-
-
-generated quantities{
-  vector[N2] y_pred_mean;
-  real y_pred[N2];
-
-  y_pred_mean = betas * x_pred;
-  
-  y_pred = normal_rng(y_pred_mean, sigma);
-
-}
-
-
-
-
-" 
-
 
 
 ```
