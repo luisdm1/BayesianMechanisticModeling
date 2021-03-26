@@ -1,0 +1,469 @@
+---
+title: "Bayesian Linear Regression"
+author: "Luis Martinez Lomeli"
+output:
+  html_document:
+    df_print: paged
+editor_options:
+  chunk_output_type: console
+---
+
+
+```{r, load-libraries, warning=FALSE, message=FALSE}
+library(ggplot2)
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+require(plyr)
+library(reshape2)
+library(utils)
+```
+
+Our first example is based on the `cars` dataset which is part of the `dataset` base library in R. It contains a data frame with 50 observations on 2 variables: speed (mph) vs distance (ft). These variables represen the speed and stopping distances of multiple cars. Let's visualize its contents:
+
+
+```{r, cache=TRUE}
+plot(cars)
+```
+
+
+# Linear regression
+
+
+Our first approach to model the relationship between car speed and stopping distance is using a linear model.
+
+The model takes the form of 
+
+$y_i = \beta_0 + \beta_1\cdot x_i + \varepsilon_i$,
+
+where $\beta_0$ and $\beta_1$ are the model parameters and represent the intercept and slope of the linear model. In this model, we assume constant error, ie, $\varepsilon_i ~ N(0, \sigma^2)$. Note that this assumption should be validated.
+
+
+## Least squares fit
+
+The first approach to fit this model is by following a least squares formulation. In this case, we define the residuals as
+
+$r_i = y_i - \hat{y_i}  = y_i - (\beta_0 + \beta_1 x_i)$.
+
+Then, we formulate the Sum of Squared Residuals (SSR) as
+
+$SSR = \sum_{i=1}^{n} r_i^2 = \sum_{i=1}^{n} r_i^2 (y_i - (\beta_0 + \beta_1 x_i))^2$.
+
+In this equation, the only unknown variables are $\beta_0$ and $\beta_1$. This means that we can write SSR(\beta_0, \beta_1). 
+Our implementation in R of SSR is defined as
+
+
+```{r, least_squares, cache=TRUE}
+
+least_squares = function(param, data){
+  
+  y_hat = param[1] + param[2]*data$x
+  
+  resid_squared = (y_hat - data$y)^2
+  
+  return(sum(resid_squared))
+}
+
+
+```
+
+Then, to fit the linear regression model to the data, we need to find the values of $\beta_0$ and $\beta_1$ for which SSR is minimal. 
+
+We can take the partial derivatives of SSR with respect of the parameters and find the roots of the equaions as a way to find the optimal parameters as shown [here](https://en.wikipedia.org/wiki/Least_squares#Solving_the_least_squares_problem). Alternatively, we can use an opimization rutine feeding the `least_squares` function that we defined above as
+
+
+```{r, least_squares_fit, cache=TRUE}
+
+data = list(x=cars$speed, y=cars$dist)
+
+
+least_squares(param=c(1,2), data=data)
+
+fitted = optim(par=c(1,2), fn=least_squares, data=data, 
+               hessian=TRUE,method="BFGS")
+
+```
+
+and we obtain our point estimates and standard errors for the parameters using,
+
+```{r}
+#Estimates
+fitted$par
+
+#standard errors
+sqrt(diag(solve(fitted$hessian)))
+```
+
+
+
+## Linear regression with likelihood function
+
+Maximum likelihood estimation and least squares estimation for linear regression models return similar point estimates. 
+The difference relies in the assumption of Gaussian errors in the likelihood formulation. This means that our likelihood function is written as
+
+$Y = N(\beta_0+\beta_1X, \sigma^2)$,
+
+where $\beta_0+\beta_1X$ and $\sigma^2$ are the mean and variance of the normal distribution correspondingly. In this case, we assume that our data points are independent and identically normally distributed. Following this approach, we can write the likelihood function as 
+
+Note that this likelihood function now also contains the parameter $sigma$ which should be estimated along with $\beta_0$ and $\beta_1$ (since we do not know it in general).
+Also, note that we consider a log-transformation of the likelihood function to facilitate the numerical optimizer. 
+
+
+```{r, lm_loglik, cache=TRUE}
+lm_loglik = function(param, data){
+  
+  mean = param[1] + param[2]*data$x
+  
+  loglik = sum(x=dnorm(data$y, mean=mean, sd=param[3], log=TRUE))
+  
+  return(-loglik)
+  
+}
+
+```
+
+This log-likelihood function will return numerical values for given parameters, for example,
+
+```{r, eval_loglik, cache=T}
+
+lm_loglik(param=c(-10,2,1), data=data)
+
+```
+
+Now, we optimize the log-likelihood function using,
+
+```{r, fitted_loglik, cache=T}
+fitted_lm_loglik = optim(par=c(1,1,1), fn=lm_loglik, data=data)
+fitted_lm_loglik$par
+```
+
+and compare with the least squares estimates (no sigma):
+
+```{r, print_ols_estim, cache=T}
+fitted$par
+```
+
+We can compare these estimates with those provided by the `lm` function,
+
+```{r, lm-summary, cache=TRUE}
+fit_lm = lm(dist ~ speed, data=cars)
+summary(fit_lm)
+
+```
+
+
+Finally, let's visualize our fitted line
+
+
+```{r, lm-plot, cache=TRUE}
+x_pred = seq(min(data$x), max(data$x), length.out = 100)
+y_pred = fitted$par[1] + fitted$par[2]*x_pred
+df_pred = data.frame(x=x_pred, y=y_pred)
+
+ggplot()+
+  geom_point(data=as.data.frame(data), aes(x=x,y=y), colour="blue", size=2)  +
+  geom_line(data = df_pred, aes(x=x_pred, y=y_pred), colour="blue", size=2) +
+  theme_bw() 
+```
+
+
+
+
+# Bayesian Linear regression 
+
+Given the likelihood 
+
+$Y = N(\beta_0+\beta_1X, \sigma^2)$, 
+
+our goal is to approximate the posterior distribution:
+
+$p(\beta_0, \beta_1,\sigma|Y)\propto p(Y|\beta_0, \beta_1,\sigma)\times p(\beta_0, \beta_1,\sigma)$
+
+where $p(\beta_0, \beta_1,\sigma)$ is the joint prior distribution for the parameters. It is common in the literature to assume that these parameters are independent from each other, this allows to obtain the simpler expression,
+
+$p(\beta_0, \beta_1,\sigma)= p(\beta_0)p(\beta_1)p(\sigma)$
+
+## STAN simple linear regression model
+
+Now, we fit this model in STAN for the `cars` dataset. Note that we are not specifying any type of prior distributions.
+
+```{r, lm-STAN-basic, cache=TRUE}
+library(rstan)
+
+
+stan_lm = "
+data {
+  int<lower=0> N; // number of records
+  vector[N] x; // predictor vector
+  vector[N] y; // response vector
+}
+
+parameters {
+  real beta0; // intercept
+  real beta1; // slope
+  real<lower=0> sigma; // noise error
+}
+
+model {
+  y ~ normal(beta0 + beta1  * x, sigma); // likelihood
+}
+
+" 
+
+stan_data = list(x=data$x, y=data$y, N=length(data$x))
+
+stan_lm = stan(model_code=stan_lm, data=stan_data, iter=5000)
+
+
+```
+
+Now, let's compare the difference between the `lm` estimates and STAN's estimates
+
+```{r, compare_estimates, cache=TRUE}
+print(stan_lm)
+confint(fit_lm)
+```
+
+Since we approximated the posterior distribution for the parameters, we can visualize the pairs marginal plots and observe the relationship among the parameters
+
+```{r, pairs_plot, cache=TRUE}
+pairs(stan_lm, pars=c('beta0', 'beta1', 'sigma'))
+```
+
+
+
+## Diagnostics
+
+MCMC sampling is generally difficult to run for complex and non linear models. However, luckily, we have a few [convergence statistics](https://mc-stan.org/rstan/reference/Rhat.html) and plots that can tell us about the quality of our approximation for the posterior samples.   
+
+```{r, summ_mcmc, cache=TRUE}
+print(stan_lm)
+```
+
+
+- Rhat: measures the within and between chains variation. In practice, any value of Rhat larger than 1.1 means that the chains have not converged correctly yet
+
+- ESS: Effective sample size. Since we are simulating a Markov chain, our samples are expected to have certain correlation. ESS indicates how many samples can be considered to be effectively independent and therefore useful for statistical inference (so we can trust the estimated point estimates and credible intervals).  In general, you should have at least 4000 for ESS. Note that if you increase the number of chains, you could obtain a higher ESS.
+
+For plots:
+
+- [Traceplot](https://mc-stan.org/rstan/reference/stanfit-method-traceplot.html): Provides a visualization of the samples generated over all the iterations
+
+- [Pairs plot](https://mc-stan.org/rstan/reference/stanfit-method-pairs.html): Bivariate visualization of MCMC parameters.
+
+Others useful links:
+
+- [https://mc-stan.org/rstan/reference/stan_plot_diagnostics.html](https://mc-stan.org/rstan/reference/stan_plot_diagnostics.html)
+- [https://mc-stan.org/rstan/reference/check_hmc_diagnostics.html](https://mc-stan.org/rstan/reference/check_hmc_diagnostics.html)
+- [https://www.statlect.com/fundamentals-of-statistics/Markov-Chain-Monte-Carlo-diagnostics](https://www.statlect.com/fundamentals-of-statistics/Markov-Chain-Monte-Carlo-diagnostics)
+
+
+```{r, plot_mcmc, cache=TRUE}
+traceplot(stan_lm)
+```
+
+## Stan Linear regression predict
+
+We can use linear regression to predict for new unobserved values of the predictor denoted `x_pred`. In STAN we can implement this as:
+
+
+```{r, lm-STAN-pred, cache=TRUE}
+
+
+stan_lm_pred = "
+data {
+  int<lower=0> N1; // number of records
+  vector[N1] x; // predictor vector
+  vector[N1] y; // response vector
+  
+  int<lower=0> N2; // number of records for prediction
+  vector[N2] x_pred; // For prediction
+}
+
+parameters {
+  real beta0; // intercept
+  real beta1; // slope
+  real<lower=0> sigma; // noise error
+}
+
+model {
+  y ~ normal(beta0 + beta1  * x, sigma); // likelihood
+}
+
+
+generated quantities{
+  vector[N2] y_pred_mean;
+  real y_pred[N2];
+
+  y_pred_mean = beta0 + beta1 * x_pred;
+  
+  y_pred = normal_rng(y_pred_mean, sigma);
+
+}
+
+
+" 
+
+stan_data = list(x=data$x, y=data$y, N1=length(data$x), 
+                 x_pred=x_pred, N2=length(x_pred))
+
+stan_lm_pred = stan(model_code=stan_lm_pred, data=stan_data, iter=10000)
+
+print(stan_lm_pred, pars=c('beta0', 'beta1', 'sigma'))
+
+pairs(stan_lm_pred, pars=c('beta0', 'beta1', 'sigma'))
+
+```
+
+
+## Exercise: Write this code in vectorized way:
+
+```{r, lm-STAN-EX-vect, cache=TRUE}
+
+stan_lm_pred_vect = "
+data {
+  int<lower=0> N1; // number of records
+  int<lower=0> K; // number of betas
+  vector[N1, K] x; // predictors matrix
+  vector[N1] y; // outcome vector
+  
+  int<lower=0> N2; // number of records for prediction
+  vector[N2, K] x_pred // matrix of predictions
+  
+}
+
+parameters {
+  real alpha; // intercept
+  vector[K] betas; // coefficients for predictors
+  real<lower=0> sigma; // error scale
+}
+
+model {
+  \\ No priors
+  
+  \\ Likelihood
+  y ~ normal(x * betas , sigma); // likelihood
+}
+
+
+generated quantities{
+  vector[N2] y_pred_mean;
+  real y_pred[N2];
+
+  y_pred_mean = betas * x_pred;
+  
+  y_pred = normal_rng(y_pred_mean, sigma);
+
+}
+
+
+
+
+" 
+
+
+
+```
+
+
+# Visualize the fitted model
+
+## Extract samples and prepare summary data frame
+
+
+Now, let's visualize our fitted model. First, we need to extract the samples from the STAN object, build the required dataframes with the  right information to generate the plots. 
+
+
+```{r, lm-STAN-extract-samples, cache=TRUE}
+
+samples = extract(stan_lm_pred)
+
+y_pred_summ = summary(stan_lm_pred, pars=c('y_pred'))$summary
+# y_hat = as.numeric(y_hat_summ$summary[,"mean"])
+
+
+df_pred = data.frame(x_pred=x_pred,
+                     ymin = as.numeric(y_pred_summ[,'2.5%']),
+                     ymax = as.numeric(y_pred_summ[,'97.5%']),
+                     ymedian = as.numeric(y_pred_summ[,'50%']),
+                     ymean = as.numeric(y_pred_summ[,'mean'])
+                    )
+#Add predictions from linear regression model
+df_pred$y_pred_lm = predict(fit_lm, list(speed=df_pred$x_pred))
+
+head(df_pred)
+
+
+```
+
+
+Here, we visualize the original data and the predicted median of the credible intervals
+
+```{r, plot, cache=T}
+# Median of Bayesian credible intervals
+
+ggplot() +
+  geom_point(data=as.data.frame(stan_data),
+           aes(x=x,y=y), colour="black", size=2)  +
+  geom_line(data=df_pred, aes(x=x_pred, y=ymedian), colour="blue", size=1.5,
+            linetype='dashed') +
+  theme_bw() -> lm_plot_base
+print(lm_plot_base)
+```
+
+And we add the 95% Bayesian credible region
+
+```{r, plot_BCI, cache=T}
+# 95% Bayesian credible intervals
+lm_plot = lm_plot_base +  
+  geom_ribbon(data=df_pred, aes(x=x_pred, ymin=ymin, ymax=ymax), 
+              alpha=0.1)
+print(lm_plot)
+```
+
+*Spaghetti plots*: This type of plots allow to visualize multiple individual model solutions. This is possible since we have a distribution over the regression line from which we select 40 individuals lines samples.
+
+```{r, plot_spaguetti, cache=T}
+TOT_SAMPLES = dim(samples$y_pred_mean)[1]
+
+#Generate data frame with individual fitted lines aka spaguetti plots
+TOT_SPAGUETTIS = 40
+SAMPLES_ID_PLOT = sample(1:TOT_SAMPLES, TOT_SPAGUETTIS)
+y_pred_mean <- adply(samples$y_pred_mean[SAMPLES_ID_PLOT,], 2)
+tmp = melt(y_pred_mean)
+names(tmp) = c("xid", "group", "y")
+tmp <- mutate(tmp, x=x_pred[xid])
+
+#Spaghetti plots: samples of individual fitted lines
+lm_plot = lm_plot +  
+  geom_line(data=tmp, aes(x=x,y=y, group=group), colour="#999999", alpha=0.3)
+print(lm_plot)
+
+```
+
+Finally, we compare the median of the Bayesian credible intervals with the point estimate provided by the `lm` model. 
+
+```{r, plot_lm, cache=T}
+
+# `lm` fitted line
+lm_plot = lm_plot_base +  
+  geom_line(data = df_pred, aes(x=x_pred, y=y_pred_lm), colour="black", size=4,
+            alpha=0.3) +
+  geom_ribbon(data=df_pred, aes(x=x_pred, ymin=ymin, ymax=ymax), 
+              alpha=0.1)
+print(lm_plot)
+
+```
+
+
+
+
+# SessionInfo
+
+```{r}
+sessionInfo()
+```
+
+
+
+

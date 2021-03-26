@@ -1,0 +1,321 @@
+---
+title: "Bayesian Logistic ODE Model"
+author: "Luis Martinez Lomeli"
+output:
+  html_document:
+    df_print: paged
+editor_options:
+  chunk_output_type: console
+---
+
+# Logistic model
+
+In this demo, we will fit the logistic growth equation to synthetic data. This equation models the continuous growth in a population which is defined as 
+
+$\frac{dN}{dt}= r N(1-\frac{N}{K})$
+
+with initial condition
+
+$N(t=0) = N_0$.
+
+In this model, $r$ defines the growth rate and $K$ is the carrying capacity interpreted as the maximum value that the population can reach.
+
+
+This model has analytical solution given by
+
+$N(t)=\frac{K}{1+(\frac{K-N_0}{N_0})e^{-rt}}$.
+
+
+
+```{r, load-libraries, warning=FALSE, message=FALSE}
+rm(list=ls())
+
+library(ggplot2)
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+library(plyr)
+library(reshape2)
+
+RUN_STAN = FALSE  #If FALSE, then will load previously simulated samples
+
+```
+
+
+
+## Foward run with fixed parameters
+
+The first step in the statistical analysis of this model is to do a forward simulation of the model considering a fix set of parameters. 
+For this purpose, we define the logistic equation function as
+
+```{r, Logistic-function, cache=TRUE}
+
+
+logistic_eq = function(r, K, N0, t){
+  return(K/(1 + ((K-N0)/N0)*exp(-r*t) ))
+}
+
+```
+
+then we set the equation parameters arbitrarily to take the value
+
+```{r, Logistic-forward-run, cache=TRUE}
+N0 = 0.1
+K = 20
+r = 1
+
+xfull = seq(0, 12, by=0.1)
+yfull = logistic_eq(r=r, K=K, N0=N0, t=xfull)
+
+plot(xfull, yfull)
+
+
+
+```
+
+This plot illustrates the characteristic shape of the logistic growth model. At early times, there is exponential growth in the population followed by slowing down and saturation.
+
+Now, we will take this ODE solution as ground truth and add i.i.i Gaussian noise with constant variance
+
+```{r, Logistic-create_df, cache=T}
+
+x = seq(0, 12, by=1)
+y = logistic_eq(r=r, K=K, N0=N0, t=x)
+
+sigma = 1.5
+
+set.seed(12345)
+ynoisy = y + rnorm(n = length(x), sd=sigma)
+
+plot(x, ynoisy)
+lines(xfull, yfull)
+
+
+df_logistic = data.frame(time=x, y=ynoisy, ytrue=y)
+
+```
+
+
+
+# General statistical model for mechanistic models
+
+We propose a general statistical model for differential equations models which describe the evolution of $m$ different entities $\mathbf{x}=(x_1,x_2,\dots,x_m)^t$ modeled by using the ODE
+
+$\frac{\partial\mathbf{x}(t)}{\partial t}=f(\mathbf{x}(t);\vec{\theta})$,
+
+
+$\mathbf{x}(0)=\mathbf{x_{0}}$,
+
+where the second equation represents the initial conditions, and the vector of model parameters is represented as
+
+
+$\vec{\theta} =  (\theta_{1},\theta_{2},\dots\theta_{k})^{t}$
+
+
+Note that the parameters in $\vec{\theta}$ are commonly interpreted as rates of change and the initial conditions $\mathbf{x_0}$ are estimated along with the model parameters.
+If $T$ data points $\mathbf{y}=\{y(t_1),\dots,y(t_T)\}$ about a complex system are available  (synthetic or experimental), we assume that they come  from the solution of the mechanistic model (\ref{eq:BasicMechanisticModel}),  $\mathbf{x}=\{x(t_1),\dots,x(t_T)\}$ evaluated at their corresponding observation times, $t_1,t_2,\dots,t_T$, with additive noise, 
+
+$\mathbf{y}(t_j) = \mathbf{x}(t_j) + \varepsilon(t_j).$
+
+
+Note that for simplifying the notation, we write $\mathbf{x}(t_j) =\mathbf{x}(t_j;\vec{\theta},\mathbf{x_0})$ and $j \in \{1,\dots T\}$.
+We assume that the noise is independent and identically distributed (i.i.d.):
+
+\varepsilon(t_j)\overset{indep}{\sim} N(0, \sigma^2).
+
+
+However, this assumption of i.i.d. normal noise should be justified in practice and can be modified to account for serial correlation or non-normal behaviors in the data.
+Our statistical model implies that the likelihood function can be written as 
+
+$ p(\mathbf{y}\mid \mathbf{x}) = \prod_{j=1}^T p(\mathbf{y}(t_j) \mid \mathbf{x}(t_j))$,
+
+    
+ where at any time point $t_j \in \{ t_1,\dots,t_T\}$,
+  
+
+$p(\mathbf{y}(t_j) \mid \mathbf{x}(t_j)) = N(\mathbf{x}(t_j),\, \sigma^2)$.
+
+
+Following a Bayesian approach, fitting the differential equations model to the empirical data, $\mathbf{y}$, requires the estimation of the parameters vector,
+
+
+
+$\vec{\Theta}=  (\vec{\theta},\,\mathbf{x_{0}},\, \sigma^2)^{t}$,
+
+
+which is done by approximating the posterior distribution,
+
+
+$p(\vec{\Theta} \mid \mathbf{y}) \propto p(\mathbf{y} \mid \mathbf{x}(\vec{\Theta})) \,p(\vec{\Theta})$.
+
+
+This approximation can be done using Markov Chain Monte Carlo methods as we show below.
+Note that the evaluation of the likelihood $p(y|x(\vec{\Theta}))$ requires the solution of the mechanistic model. 
+This is commonly done using Runge-Kutta solvers for differential equations.
+
+
+## Exercise 
+
+**Write the statistical model for the logistic ODE. What is $\vec{\theta}$, $\vec{\Theta}$ and the likelihood function?**
+
+
+# Fitting the logistic ODE in STAN
+
+We will fit the model in STAN. First, we need to define the data dictionary with all the data information. 
+Then, we need to specify the sampler parameters
+
+```{r, Logistic-STAN, cache=TRUE}
+stan_data = list(N_ts = length(df_logistic$y), obs_times = df_logistic$time, 
+                 y_obs = df_logistic$y, N0=N0, sigma=sigma, K=K)
+
+cat(readLines('Logistic-equation.stan'), sep = '\n')
+
+if (isTRUE(RUN_STAN)){
+  stan_logistic = stan(file = 'Logistic-equation.stan', data=stan_data, 
+                        iter=5000, chains = 4, seed=1234)
+  save(stan_logistic, file='data/Logistic_STAN.rda.gzip', compress=TRUE)
+  
+} else{ 
+  load(file='data/Logistic_STAN.rda.gzip')
+}
+
+print(stan_logistic)
+
+```
+
+## Diagnostics
+
+Why do we have more variables in the summary?
+
+```{r, stan-diagnostics, cache=T}
+print(stan_logistic, pars=c('r', 'K', 'sigma'))
+traceplot(stan_logistic, pars=c('r', 'K', 'sigma'))
+pairs(stan_logistic, pars=c('r', 'K', 'sigma'))
+
+```
+
+
+## Visualization
+
+First, we extract the samples and create the summary data frames which are used for plotting. Also, select a few ODE solution curves for spaghetti plots.
+
+```{r, Logistic-STAN-plot, cache=TRUE}
+
+samples = extract(stan_logistic)
+
+# Create data frame of ODE solutions adding initial condition at the beginning of the data frame
+y_checks_mean_summ = summary(stan_logistic, pars=c('y_checks_mean'))$summary
+
+
+df_y_checks_mean = data.frame(median=y_checks_mean_summ[,"50%"],
+                              time = df_logistic$time)
+df_y_checks_mean
+
+# Create posterior checks summary
+
+y_checks_summ = summary(stan_logistic, pars=c('y_checks'))$summary
+
+df_pred = data.frame(time=df_logistic$time,
+                     ymin = as.numeric(y_checks_summ[,'2.5%']),
+                     ymax = as.numeric(y_checks_summ[,'97.5%']),
+                     ymedian = as.numeric(y_checks_summ[,'50%']),
+                     ymean = as.numeric(y_checks_summ[,'mean'])
+                    )
+df_pred
+
+TOT_SAMPLES = dim(samples$y_checks_mean)[1]
+#Generate data frame with individual fitted lines aka spaguetti plots
+TOT_SPAGUETTIS = 40
+SAMPLES_ID_PLOT = sample(1:TOT_SAMPLES, TOT_SPAGUETTIS)
+y_checks_mean <- adply(samples$y_checks_mean[SAMPLES_ID_PLOT,], 2)
+tmp = melt(y_checks_mean)
+names(tmp) = c("xid", "group", "y")
+tmp <- mutate(tmp, x=df_logistic$time[xid])
+
+
+```
+
+
+Synthetic data used for fitting
+
+```{r, data-plot, cache=T}
+
+# Logistic synthetic data
+
+ggplot() +
+  geom_point(data=df_logistic,
+           aes(x=time, y=y), size=4, shape=4, stroke=2) +
+  theme_bw() -> logistic_plot_base
+print(logistic_plot_base)
+```
+
+
+Plot the synthetic data and the posterior predictive checks error bars.
+The posterior predictive checks is a powerful tool to assess Goodness of Fit for Bayesian models. The idea is to fit the model and then simulate synthetic data from it. Then compare the resulting data distributions vs the actual observed data. If there are systematic discrepancies we conclude that the model is not doing a very good job modeling the data.
+
+References: 
+
+* [Gelman and Hill, 2007 p18](http://www.stat.columbia.edu/~gelman/arm/) and 
+
+* [Gerlman, et. al. 2004 p. 169](http://www.stat.columbia.edu/~gelman/book/)
+
+
+
+```{r, posterior-checks, cache=T}
+
+# 95% Bayesian credible error bars for posterior checks
+
+logistic_plot = logistic_plot_base +  
+  geom_errorbar(data=df_pred, 
+                aes(x=time, ymin=ymin, ymax=ymax)) +
+  ggtitle('95% Posterior Predictive Checks')
+print(logistic_plot)
+
+
+```
+
+Spaghetti plots
+
+
+```{r, spaghetti, cache=T}
+#Spaghetti plots: samples of individual fitted lines
+logistic_plot = logistic_plot_base +  
+  geom_line(data=tmp, aes(x=x,y=y, group=group), colour="#999999", alpha=0.3)+
+  ggtitle('Distribution of fitted ODE solutions')
+print(logistic_plot)
+```
+
+
+95% Bayesian Credible Intervals
+
+```{r, credible-region, cache=T}
+# Fitted line
+logistic_plot = logistic_plot_base +  
+  geom_line(data = df_pred, aes(x=time, y=ymedian), size=1,
+            alpha=1) +
+  geom_ribbon(data=df_pred, aes(x=time, ymin=ymin, ymax=ymax),
+              alpha=0.1,show.legend = FALSE)+
+  ggtitle('95% Bayesian Credible Intervals and Median')
+ 
+print(logistic_plot)
+```
+
+
+
+## Exercise: 
+
+* **Fit the simple linear regression model to the Logistic dataset**
+* **Check diagnostics, spaghetti plots and posterior checks plot**
+* **What can you conclude?**
+
+```{r, Logistic-Exercise, cache=TRUE}
+
+```
+
+
+# Session Info
+```{r}
+library(utils)
+sessionInfo()
+```
+

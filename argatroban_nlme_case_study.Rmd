@@ -1,0 +1,615 @@
+---
+title: "Bayesian Non-Linear Mixed-Effects Model of Argatroban"
+output:
+  html_document: 
+    toc: yes
+    fig_width: 9
+    fig_height: 6
+    number_sections: yes
+
+editor_options:
+  chunk_output_type: console
+---
+# Introduction
+
+```{r, warning=FALSE, message=FALSE}
+library(ggplot2)
+library(rstan)
+library(nlme)
+library(forestplot)
+library(kableExtra)
+library(reshape2)
+library(dplyr)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores() )
+
+```
+
+# Disclaimer
+
+This demo presents a Bayesian version of the Argatroban ODE study presented in
+[#fitzmaurice2008longitudinal](https://www.routledge.com/Longitudinal-Data-Analysis/Fitzmaurice-Davidian-Verbeke-Molenberghs/p/book/9781584886587).
+
+The Bayesian parameter estimates are compared to the `nlme` and `SAS` estimates following the R scripts available [here](https://www4.stat.ncsu.edu/~davidian/st732/examples.html)
+
+# Introduction
+
+The pharmaceutical drug Argatroban is an anticoagulant that was approved for commercial use by the Food and Drug Administration (FDA) in 2000. This drug is indicated for the treatment and prophylaxis of thrombosis in patients with heparin-induced thrombocytopeniaThrombocytopenia is defined as the deficiency of platelets in the blood. One of the main consequences is slow blood clotting after receiving an injury., and in patients with other conditions [#Dhillon2009]. 
+
+In this particular dataset, it is mentioned in [#fitzmaurice2008longitudinal] that there were nine different doses of Argatroban ranging from 1.0 to 5.0 \mu g/kg/min in increments of 0.5, and four subjects were assigned at random to each dose. A final subject received a dose of 4.38 \mu g/kg/min for a total of 37 different subjects. Different blood samples were acquired from the subjects, from where it was able to estimate the current Argatroban concentration present plasma. 
+
+# Exploratory Data Analysis
+
+```{r, EDA, message=FALSE, cache=F}
+data = read.table("https://www4.stat.ncsu.edu/~davidian/st732/examples/argconc.dat")
+colnames(data) = c('obsno','indiv','dose','time','conc')
+
+head(data)
+
+means_by_conc = data %>% 
+        group_by(time, dose) %>% 
+        summarise(conc = mean(conc))
+means_by_conc$dose = as.factor(means_by_conc$dose)
+summary(means_by_conc)
+
+data_plot = data
+data_plot$indiv = as.factor(data_plot$indiv)
+data_plot$dose = as.factor(data_plot$dose)
+
+```
+
+```{r EDA-plots, cache=TRUE}
+
+ggplot(data=data_plot, aes(x=time, y=conc, group=indiv, colour=dose))+
+  geom_vline(xintercept=240, colour="blue", size=1.5, linetype='dashed') +
+  geom_line(size=1)+
+  scale_x_continuous(breaks=seq(0, 360, by = 25))+
+  theme_bw() +
+  xlab('Time') +
+  ylab('Argatroban Concentration') + 
+  ggtitle('Subjects Measured Concentrations Over Time')+
+   theme(text = element_text(size=20, face='bold')) 
+
+
+ggplot(data_plot, aes(x=time, y=conc, group=time)) + 
+  geom_vline(xintercept=240, colour="blue", size=1.5, linetype='dashed') +
+  geom_boxplot()  +
+  scale_x_continuous(breaks=seq(0, 360, by = 25))+
+  theme_bw() +
+  xlab('Time') +
+  ylab('Argatroban Concentration') + 
+  ggtitle('Concentration by Observation Times')+
+   theme(text = element_text(size=20, face='bold')) 
+
+
+ggplot(means_by_conc, aes(x=time, y=conc, group=dose, colour=dose)) + 
+  geom_vline(xintercept=240, colour="blue", size=1.5, linetype='dashed') +
+  geom_line(size=1, alpha=0.5)+
+  geom_point(size=2)+
+  scale_x_continuous(breaks=seq(0, 360, by = 25))+
+  theme_bw() +
+  xlab('Time') +
+  ylab('Mean Argatroban Concentration') + 
+  ggtitle('Mean Concentration by Dose')+
+   theme(text = element_text(size=20, face='bold')) 
+
+```
+We observe the measured Argatroban concentration for all the subjects and how as the infusion dose of the drug increases, the concentration on plasma tends to increase accordingly. However, after the 4 hours of continuous administration, there is a sudden drop in the blood concentration of Argatroban caused by the metabolization of the drug. Each patient has different response curves even under the same dose administered. We notice at time t_{inf}=240 the exponential decay dynamics after the administration of the drug stopped.
+
+# ODE model
+
+The data shows a non-linear response that has a major change when the subjects stop receiving the drug. A proposed model for the drug concentration is the one-compartment where we assume that the amount of drug in the body $A(t)$,constant infusing supply $D$, and first order clearance rate per volume as $k_{e}$
+
+$\frac{dA}{dt}=D-k_{e}A(t)$,
+
+where the initial condition is $A(0)=0$ since no patient was receiving a drug before the beginning of the experiment. The analytical solution for this equation is given by 
+
+$A(t)=\frac{D}{k_{e}}\left(1-e^{k_{e}t}\right)$.
+
+This model can be rewritten by expressing the amount of drug $A(t)$ in terms of the blood plasma drug concentration, $C(t)=A(t)/V$,  and decompose the rate $k_{e}=Cl/V$ as the clearance rate per volume of the compartment. In this case, the ODE now takes the form of
+
+$C(t)=\frac{D}{Cl}\left(1-e^{\frac{Cl}{V}t}\right)$.
+
+The last step in the ODE model derivation is to consider the end of the drug intake at time $t_{inf}=240$ min. One way to model this is by discounting the  analytical solution by a factor $e^{-kt_{inf}}$. This leads to the modified ODE solution 
+
+$C(t)=\frac{D}{Cl}\left[exp\left(-\frac{Cl}{V}(t-t_{inf})_{+}\right)-exp\left(-\frac{Cl}{V}t\right)\right]$,
+
+where $(t-t_{inf})_{+}=0$ if $t\leq t_{inf}$ and $(t-t_{inf})_{+}=t-t_{inf}$
+if $t>t_{inf}$
+
+
+
+# Hierarchical Model
+
+Part of the goal of the Argatroban study was to characterize the typical response of the subjects based on different doses of the drug. Also, to identity the amount of subject-specific variation in the response. With these two objectives in mind, we fit the response function to the patient data, using our hierarchical model which can be written as a multi-stage model:
+
+*Stage-1: individual level*
+ 
+ $Y_{ij}=  C\left(t_{ij},\mathbf{U}_{i},\vec{\theta}_{i}\right)+e_{ij}$
+
+where $j=1,...,n_{i}$. This formulation implies that first moment of the response variable is $E[Y_{ij}]=C(t_{ij};\mathbf{U}_{i},\vec{\theta}_{i})$, where $\mathbf{U}_{i}=(D_{i},t_{inf}=240)^{t}$ represents the dose of Argatroban infused to each patient until time $t_{inf}=240$ min when the administration of the drug was stopped. 
+
+For the second stage formulation, we express the parameters of the non-linear response in terms of population level parameters $\vec{\beta}=\left(\beta_{1},\beta_{2}\right)^{t}$, and allow for subject-specific contributions in the form of constant random effects $\mathbf{b}_{i}$. We assume that $\mathbf{b}_{i}\sim N(\mathbf{0},G)$ with $G$ the covariance matrix of random effects. With these considerations the second stage model is represented as 
+
+*Stage-2 Population level*
+ 
+ $\vec{\theta}_{i}=  \mathbf{d}\left(\vec{A}_{i},\vec{\beta},\mathbf{b}_{i}\right),$
+ 
+ where $i=1,...,N$ and the subject-specific parameters vector  is written as $vec{\theta}_{i}=(Cl^{*},V^{*})^{t}$. Note that the ODE parameters $Cl$ and $V$ need to be strictly non-negative (or zero), thus we use an alternative formulation of the  population level parameters as
+
+$Cl^{*}=log(Cl)=\beta_{1}+b_{i1}$ 
+
+and  
+
+$V^{*}=log(V)=  \beta_{2}+b_{i2}$.
+
+Under this model, $e^{\beta_{1}}$ and $e^{\beta_{2}}$ will represent the medians of the clearance and volume parameters in the population and $b_{i1}$ and $b_{i2}$ represent the random effects of the populations. 
+
+*Conditional mean and conditional covariance matrix*
+
+The reparametrizations [eq:argatrobran_reparam_params] imply that the conditional mean (or first moment of the response variable) can be written in terms of $Cl^{*}$ and $V^{*}$ as
+
+*The conditional mean response for the $i$th individual *
+
+
+$E\left(Y_{ij}|\mathbf{U}_{i},\vec{\theta}_{i}\right)=\frac{D_{i}}{e^{Cl_{i}^{*}}}\left[exp\left(-\frac{e^{Cl_{i}^{*}}}{e^{V_{i}^{*}}}(t_{ij}-t_{inf})_{+}\right)-exp\left(-\frac{e^{Cl_{i}^{*}}}{e^{V_{i}^{*}}}t_{ij}\right)\right]$
+
+and the intra-individual covariance structure is
+
+
+$Var\left(Y_{i}|\mathbf{U}_{i},\vec{\theta}_{i}\right)=\sigma_{e}^{2}diag\left\{ C^{2\lambda}(t_{i1},\mathbf{U}_{i},\mathbf{\vec{\theta}}_{i}),...,C^{2\lambda}(t_{in_{i}},\mathbf{U}_{i},\vec{\theta}_{i})\right\}$.
+
+As noted in [#fitzmaurice2008longitudinal], this covariance structure is known as the “power variance” and assumes that the records are sufficiently spaced so that the autocorrelation of the realization process is considered negligible. When we take the power of the concentration of the drug at different times $t_{i1},...,t_{in_{i}}$, we assume that the measurement error is proportional to “an unknown power-of-mean response”. This is an standard way to represent that the assays used the drug concentration in blood plasma, would provide non-constant measurement errors for which their variance increases with the magnitude of the response. We define in the vector $\vec{\alpha}=(\sigma_{e}^{2},\lambda)$ the elements of the intra-individual covariance components. 
+
+
+*Stage 3- Hyperpriors:*
+
+In the last specification of the hierarchical model, we define the hyperpriors
+
+$\left(\vec{\beta},\vec{\alpha},G\right)\sim  f\left(\vec{\beta},\vec{\alpha},G\right)=f(\vec{\beta})f(\vec{\alpha})f(G).$
+
+*Pop-level parameters (main effects)*
+In our analysis, we consider weakly informative priors for the joint vector of population-level parameters $\vec{\beta}$. Our choice is to consider a bivariate normal distribution 
+
+$\vec{\beta}\sim N_{2}(\mathbf{0},\sigma^{2}\otimes\mathbf{I}_{2\times2})$,
+
+which is centered at zero, and with variance parameter $\sigma^{2}=10^{2}$. Note that this approach is similar to the case of priors chosen for the parameters used in Bayesian linear regression. For the elements of $\vec{\alpha}$ we define,
+
+$\lambda\sim LogNormal(0, 1)$ and $\sigma_{e}\sim TruncCauchy(0,\:2.5)$
+
+since the STAN documentation mentions that the truncated Cauchy distribution leads to good results for scale parameters under Hamiltonian Monte Carlo [#RStan2016]. 
+
+*Subject-Specific parameters (random effects)*
+
+$\mathbf{b}_{i} \sim N_{2}(\mathbf{0},G)$
+
+For the covariance matrix of random effects G, instead of using an inverse-Wishart distribution, we decompose G to make explicit its associated correlation matrix with
+
+*Covariance and correlation matrix of random effects*
+
+$G=diag(\sigma_{1}^{2},\sigma_{2}^{2})\,\Omega\,diag(\sigma_{1}^{2},\sigma_{2}^{2})$
+
+where \Omega is the correlation matrix between the random effects $b_{i1}$ and $b_{i2}$, and $diag(\sigma_{1}^{2},\sigma_{2}^{2})$ represents a diagonal matrix with diagonal entries the variance of the random effects. Under this decomposition, we can place an LKJ prior distribution in the correlation matrix as 
+
+$\Omega\sim LKJ(\eta)$ 
+
+where $\eta$ measures the strength of the correlation, e.g., if $\eta>1$ the prior has mode over the diagonal of the matrix $\Omega$, which implements the assumption that there is very low correlation between the random effects known **a priori**. The advantage of this factorization is that we can explicitly specify our prior belief on the correlation matrix $\Omega$, as compared to placing a prior in the covariance matrix G. The STAN manual recommends to further consider the Cholesky factorization of the LKJ prior on $\Omega$ to obtain a better numerical stability. Therefore the prior chosen for the correlation matrix is given by 
+
+$\Omega\sim LKJ-Cholesky(\eta=2)$ and $\sigma_{1}^{2},\sigma_{2}^{2}\sim TruncCauchy(0,2.5)$
+
+which reflects a low a priori correlation between the random effects and a weakly informative prior in their scale parameter. In the following section, we show the results of this set up by doing full Bayesian inference. 
+
+
+
+# Model fitting 
+## nlme library
+
+
+Example taken from the [course notes] (https://www4.stat.ncsu.edu/~davidian/st732/examples/arg_nlme.R) 
+```{r, nlme-fit, echo=TRUE, cache=TRUE, warning=FALSE}
+
+ode_model = function(t, b1, b2, dose){
+	tinf = 240
+	cl = exp(b1)
+	v = exp(b2)
+  t1 = t <= tinf
+  t2 = tinf*(1 - t1) + t1*t
+  f1 = (dose/cl) * (1 - exp(-cl*t2/v)) * exp(-cl*(1 - t1)*(t - tinf)/v)
+  
+  return(f1)
+}
+
+
+nlme_fit = nlme(conc ~ ode_model(time, b1, b2, dose),
+                data = data,
+                fixed = list(b1 ~ 1, b2 ~1),
+                random = list(b1 ~ 1, b2 ~ 1),
+                groups = ~ indiv,
+                weights = varPower(0.5),
+                start = list(fixed = c(-6.0,-2.0)),
+                method = "ML",
+                verbose = FALSE)
+
+
+print(summary(nlme_fit))
+
+nlme_fit$sigma
+nlme_fit$coef$random
+
+VarCorr(nlme_fit)
+
+D.T = diag(VarCorr(nlme_fit)[1:2,2])
+D.T
+
+
+D.corr = as.numeric(VarCorr(nlme_fit)[2,3])
+D.corr
+
+D.Gam = diag(2)
+D.Gam[1,2]=D.corr; D.Gam[2,1]=D.corr
+D.Gam
+
+D.nlme_fit = D.T%*%D.Gam%*%D.T
+D.nlme_fit
+
+nlme_fit_summary = summary(nlme_fit)
+
+
+
+G_RESCALE_FACTOR = 1000
+nlme_estimates = data.frame(beta1=as.numeric(nlme_fit$coefficients$fixed[1]),
+                            beta2=as.numeric(nlme_fit$coefficients$fixed[2]),
+                            corr = nlme_fit_summary$corFixed[1, 2],
+                            sigmae=nlme_fit$sigma,
+                            lambda=as.numeric(nlme_fit$modelStruct$varStruct),
+                            G11=D.nlme_fit[1,1],
+                            G12=D.nlme_fit[1,2]*G_RESCALE_FACTOR,
+                            G22=D.nlme_fit[2,2]*G_RESCALE_FACTOR)
+nlme_estimates$cv_cl = sqrt(nlme_estimates$G11)*100
+nlme_estimates$cv_v = sqrt(nlme_estimates$G22/G_RESCALE_FACTOR)*100
+
+nlme_estimates_se = data.frame(beta1=sqrt(nlme_fit$varFix)[1, 1],
+                              beta2=sqrt(nlme_fit$varFix)[2, 2],
+                              corr=NA, sigmae=NA, lambda=NA, G11=NA, G12=NA,
+                              G22=NA, cv_cl=NA, cv_v=NA)
+
+nlme_estimates = t(round(nlme_estimates, 2))
+nlme_estimates_se = lapply(nlme_estimates_se, round, 3)
+
+
+
+sas_estimates = data.frame(beta1=-5.424, beta2=-1.924, corr=0.19, sigmae=13.88,
+                           lambda=NA, G11=0.141, G12=6.56, G22=6.01,
+                           cv_cl=37.54, cv_v=7.75)
+sas_estimates_se = data.frame(beta1=0.063, beta2=0.030,
+                              corr=NA, sigmae=NA, lambda=NA, G11=NA, G12=NA,
+                              G22=NA, cv_cl=NA, cv_v=NA)
+
+sas_estimates = t(sas_estimates)
+sas_estimates_se = lapply(sas_estimates_se, round, 3)
+
+freq_estimates = cbind(nlme_estimates, nlme_estimates_se, 
+                       sas_estimates, sas_estimates_se)
+colnames(freq_estimates) = c('Estimate', 'S.E.', 'Estimate', 'S.E.')
+freq_estimates
+
+```
+
+
+## STAN
+
+
+```{r, stan_model, cache=T}
+cat(readLines('argatroban_model.stan'), sep='\n')
+```
+
+
+```{r stan_fit, cache=T}
+stan_data = list(N_subj = length(unique(data$indiv)),
+                 Tot_obs = dim(data)[1],
+                 N_rec_psubj = as.numeric(table(data$indiv)),
+                 N_rand_eff = 2,         
+                 p = 2,
+                 obsno = data$obsno,
+                 indiv = data$indiv,
+                 dose = data$dose,
+                 time = data$time,
+                 conc = data$conc,
+                 eta_ljk_shape = 3.0,
+                 beta_loc = 0, beta_scale = 10,
+                 sigma_e_loc = 0, sigma_e_scale = 2.5,
+                 lambda_loc = 0, lambda_scale=1
+)
+
+load("data/argatroban_stan_inference_simulated.rda")
+stan_samples = rstan::extract(argatroban_analytic, permuted=TRUE)
+stan_fit = argatroban_analytic
+
+head(stan_samples[['median_cl']])
+
+
+```
+
+
+```{r, stan_summaries, cache=TRUE}
+
+stan_params = c("beta", 'G_scales_cor[1,2]', "sigma_e",  "lambda", 
+                "G[1,1]","G[1,2]", "G[2,2]", 'cv_cl', 'cv_v')
+stan_summary = summary(stan_fit, pars= stan_params, 
+                       prob=c(0.025, 0.5, 0.975))$summary
+
+stan_summary = stan_summary[, c('2.5%', '50%', '97.5%')]
+rownames(stan_summary) = c('beta1', 'beta2', 'corr', 'sigmae', 'lambda',
+                           'G11', 'G12', 'G22',  'cv_cl', 'cv_v' )
+
+stan_summary[c('G12', 'G22'), ] = (
+  stan_summary[c('G12', 'G22'), ]*G_RESCALE_FACTOR
+)
+
+stan_summary = round(stan_summary, 3)
+
+fits_summary = cbind(stan_summary, freq_estimates)
+
+stat = colnames(fits_summary)
+fits_summary = rbind(stat, fits_summary)
+
+colnames(fits_summary) = c('', 'R-STAN', '', 'R-NLME', '', 'SAS-NLMIXED', '')
+rownames(fits_summary) = c('Stat', 'beta_1', 'beta2', 'Corr', 'sigma_e', 'lambda', 'G11', 'G12', 'G22', 'CV Cl', 'CV V')
+
+```
+
+
+
+## Posterior Predictive
+
+
+Posterior predictive region for 6 different subjects chosen at random. This region provides a measure of uncertainty about non-linear solution to the patient data. 
+
+
+```{r post-pred, cache=TRUE, fig.height=12, fig.width=9}
+
+# We use the multiplot function defined in
+#http://www.cookbook-r.com/Graphs/Multiple_graphs_on_one_page_(ggplot2)/
+
+multiplot <- function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+  library(grid)
+  
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+  
+  numPlots = length(plots)
+  
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                     ncol = cols, nrow = ceiling(numPlots/cols))
+  }
+  
+  if (numPlots==1) {
+    print(plots[[1]])
+    
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+    
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+      
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
+}
+
+
+
+
+post_pred_plot = function(subj_ID, plot_type='pred'){
+
+  range_min = sum(stan_data$N_rec_psubj[1:(subj_ID - 1)]) + 1
+  range_max = (sum(stan_data$N_rec_psubj[1:(subj_ID-1)]) 
+                + stan_data$N_rec_psubj[subj_ID])
+  
+  subj_rec_range = range_min:range_max
+  
+  data_subject = data.frame(stan_data[c("time", "conc")])[subj_rec_range,]
+  
+  
+  if (plot_type == 'Checks'){
+    summary_y = summ_y_check[subj_rec_range,]
+    median_desc = '(points)'
+    plot_desc = 'Posterior Predictive Checks'
+  } else if (plot_type == 'pred'){
+    summary_y = summ_y_predictive[subj_rec_range, ]
+    median_desc = 'ODE solution (line)'
+    plot_desc = 'ODE Posterior Predictive Distribution'
+  }
+  
+  df_plot = data.frame(x = data_subject$time,
+                          ymin = summary_y$X2.5.,
+                          ymedian = summary_y$X50.,
+                          ymax = summary_y$X97.5.)
+
+ 
+  fig_pred = ggplot()+
+    geom_point(data=data_subject, aes(x=time,y=conc), 
+               colour="black", size=3, shape=8)+
+    ggtitle(paste0("Subject ", subj_ID, " 95%BCI ", plot_desc),
+            subtitle = paste0("Real data (stars) and median ", median_desc))+
+    xlab("Minutes")+ ylab('Argatrobam conc ng/ml') + 
+    theme_bw()
+  
+   if (plot_type == 'Checks'){
+    
+    fig_pred = fig_pred + 
+      geom_errorbar(data=df_plot,
+                    aes(x=x, ymin=ymin, ymax=ymax), alpha=1,width=0.2)+
+      geom_point(data=df_plot,
+                    aes(x=x, y=ymedian),colour="black", size=2)
+
+  } else if (plot_type == 'pred'){
+      fig_pred = fig_pred + 
+        geom_ribbon(data=df_plot,
+                   aes(x=x, ymin=ymin, ymax=ymax), alpha=0.4)+
+        geom_line(data=df_plot,
+                   aes(x=x, y=ymedian), alpha=1) 
+  }
+  return(fig_pred)
+}
+
+
+
+probs_95BCI = c(0.025, 0.5, 0.975)
+
+summ_y_check = data.frame(summary(stan_fit, 
+                                  probs=probs_95BCI,
+                                  pars="conc_check")$summary)
+
+summ_y_predictive = data.frame(summary(stan_fit, 
+                                       probs=c(0.025, 0.5, 0.975),
+                                       pars="m_ij")$summary)
+
+
+subj_checks = sort(sample(1:stan_data$N_subj, 8))
+multiplot(post_pred_plot(subj_checks[1], plot_type = 'pred'),
+          post_pred_plot(subj_checks[2], plot_type = 'pred'),
+          post_pred_plot(subj_checks[3], plot_type = 'pred'),
+          post_pred_plot(subj_checks[4], plot_type = 'pred'),
+          post_pred_plot(subj_checks[5], plot_type = 'pred'),
+          post_pred_plot(subj_checks[6], plot_type = 'pred'),
+          post_pred_plot(subj_checks[7], plot_type = 'pred'),
+          post_pred_plot(subj_checks[8], plot_type = 'pred'), cols=2)
+
+```
+
+## Posterior Checks
+
+Posterior predictive checks for 6 different subjects chosen at random. Once we fitted the NLME model to the real patients data, we will have a posterior distribution for all the parameters in the NLME model. Then we sample from the posterior distributions of the parameters and solve the non-linear model iteratively (solid lines) and we add random noise (errobars). The real data points (stars) lie within the synthetic data distributions (errorbars) which show the quality of the model. 
+
+
+```{r, post-checks, cache=T}
+multiplot(post_pred_plot(subj_checks[1], plot_type = 'Checks'),
+          post_pred_plot(subj_checks[2], plot_type = 'Checks'),
+          post_pred_plot(subj_checks[3], plot_type = 'Checks'),
+          post_pred_plot(subj_checks[4], plot_type = 'Checks'),
+          post_pred_plot(subj_checks[5], plot_type = 'Checks'),
+          post_pred_plot(subj_checks[6], plot_type = 'Checks'),
+          post_pred_plot(subj_checks[7], plot_type = 'Checks'),
+          post_pred_plot(subj_checks[8], plot_type = 'Checks'), cols=2)
+```
+
+
+
+## Forestplots
+Individual-level predictions for ODE parameters
+```{r forestplots, cache=TRUE}
+#####	Draw (keep) samples for the subjet-specific parameters from non-linear function
+
+data_subjects_dose = data[,c('indiv', 'dose')]
+data_subjects_dose = data_subjects_dose[!duplicated(data_subjects_dose),]
+
+N_subj = length(unique(stan_data$indiv))
+par(mfrow=c(1,1))
+
+params = c("median_cl","median_v")
+params_labels = c('Clearance Rate (μg/ml/kg)', 'Volume Rate (ml/kg)')
+
+keep <- 1:37#1:stan_data$N_subj#sample(1:N_subj,20)
+
+for (param_ix in 1:length(params)){
+  rand_eff_summary = data.frame(summary(argatroban_analytic, 
+                                        pars=params[param_ix], 
+                                        probs=c(0.025,0.5,0.975))$summary)
+
+  labelText <- rbind(c("Subject", "Dose", "2.5%", "50%", "97.5%"),
+                     round(
+                       cbind(data_subjects_dose$indiv[keep],
+                             data_subjects_dose$dose[keep],
+                             rand_eff_summary$X2.5.[keep],
+                             rand_eff_summary$X50.[keep],
+                             rand_eff_summary$X97.5.[keep]),1)
+  )
+  
+
+
+  foresplot_data = structure(
+                    list(
+                       mean = c(NA,rand_eff_summary$X50.[keep]),
+                       lower = c(NA,rand_eff_summary$X2.5.[keep]),
+                       upper = c(NA,rand_eff_summary$X97.5.[keep])),
+                    .Names = c("mean", "lower", "upper"), 
+                    row.names = c(NA, -38L), 
+                    class = "data.frame")
+  
+  forestplot::forestplot(labelText, 
+             foresplot_data,
+             new_page = TRUE,
+             is.summary = c(TRUE, rep(FALSE, 37)),
+             #clip=c(100, 250),
+             zero=mean(rand_eff_summary$X50.),
+             col=fpColors(box="royalblue", 
+                          lines="darkblue", 
+                          summary="royalblue"),
+            title = paste0("Subject-Specific Posterior Medians and ",
+                          "95% Prob Int for ", params_labels[param_ix]),
+            xlab = params_labels[param_ix]
+        
+  )
+      
+}
+
+
+
+
+```
+
+
+## STAN diagnostics
+```{r, stan-diagn, cache=TRUE}
+params_main = c("beta[1]", "beta[2]", "sigma_e")
+params_main = stan_params
+pairs(argatroban_analytic, pars=params_main)
+```
+
+
+# Results and Interpretations
+
+```{r, fits-summ, cache=TRUE}
+
+options(knitr.kable.NA = '')
+
+fits_summary %>%
+  kbl() %>%
+  kable_classic(full_width = F, html_font = "Cambria")%>%
+  row_spec(row=0, align = "c", bold=T, extra_css = "border-bottom: 0px solid") %>%
+  row_spec(row=1, align = "c", extra_css = "border-bottom: 1px solid") %>%
+  row_spec(row=2:11, align = "c")
+  
+```
+Posterior distributions for the DE parameters  in the
+Argatroban study. The estimates of $G[1,1]$ and $G[2,2]$ were multiplied
+by $10^{3}$. In the right it is shown the estimates presented on
+\cite{fitzmaurice2008longitudinal} using SAS NLMIXED (Gauss--Hermite
+quadrature) and R NLME (analytical approximation to the likelihood).  Bayesian model is easier to implement from computational point of view since it is more scalable. We observe the coefficients of variation of the random effects from the DE parameters calculated as $\sqrt{G[1,1]}\times100$, and the correlation between the two random effects.
+
+We show in table [tab:Summary-Posteriors-Argatroban-1] the summaries of the 95% posterior distributions for all the elements of the hierarchical model. If we exponentiate the first parameters \beta_{1} and \beta_{2} and rescale them by a factor of 1000, we found the typical values for these parameters in the population. Thus, the typical value for the Argatroban clearance rate, $Cl$, in the population was $4.43 \, \mu g/ml/kg \;(95\% BCI (3.85, 5.04))$. For the volume rate, $V$, the typical value in the population is $154\, ml/kg \; (95\% BCI (143.7, 167))$. 
+
+
+In the previous table, we find the estimates of the coefficients of variation for the subject-specific DE parameters estimates. For the first row, we observe that there was a median of $40.33\%$ variation in the estimate for the clearance rate, $Cl$, of Argatroban in the body $(95%BCI (32.14, 52.16))$. Similarly, the estimated median coefficient of variation for the volume of distribution, $V$, is $11.15\%$ $(95% BCI (2.91,19.21))$. We conclude that the main driver of the heterogeneous response of Argatroban concentration in plasma is the clearance rate. Finally, the estimated median correlation between both clearance and volume rates is $0.26$  $(95\% BCI (-0.25,0.65))$ although this estimate is not significant at the 95% significance level.
+
+
+# Session Info
+
+```{r}
+library(utils)
+sessionInfo()
+```
+
+
+
